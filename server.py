@@ -33,8 +33,15 @@ _rawinput = None
 if platform.system() == "Windows":
     try:
         import rawinput_win as _rawinput
-    except Exception:
+    except Exception as _e:
+        # Loud, not silent: without Raw Input the server falls back to the
+        # recenter path, where the local cursor is NOT frozen while remote.
         _rawinput = None
+        print("!" * 60)
+        print(f"WARNING: Raw Input unavailable ({_e!r}).")
+        print("  The server cursor will NOT freeze while controlling a client")
+        print("  (and clicks may leak). Ensure rawinput_win.py is present.")
+        print("!" * 60)
 
 # ---------------------------------------------------------------------------
 # Constants
