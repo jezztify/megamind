@@ -23,6 +23,7 @@ six.py
 # Diagnostics / scratch
 test_capture.py
 test_inject.py
+test_keys.py
 
 # IDE
 .vscode/

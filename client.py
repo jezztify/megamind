@@ -71,6 +71,20 @@ _click_state: int = 1          # 1=single, 2=double, 3=triple (kCGMouseEventClic
 DOUBLE_CLICK_SECONDS: float = 0.5
 DOUBLE_CLICK_DIST: int = 6
 
+# Keyboard modifier state, tracked from forwarded modifier key events.
+# pynput reports the BASE character for the number row even when Shift is held
+# (e.g. Shift+2 -> '2', not '@'), and its character injection then normalizes
+# the modifier away. We resolve the shifted symbol ourselves before injecting.
+_shift_down: bool = False
+_remapped_chars: dict = {}     # base char -> injected char, for press/release symmetry
+_SHIFT_NAMES = {"shift", "shift_l", "shift_r"}
+_SHIFT_MAP = {
+    "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
+    "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
+    "`": "~", "-": "_", "=": "+", "[": "{", "]": "}",
+    "\\": "|", ";": ":", "'": '"', ",": "<", ".": ">", "/": "?",
+}
+
 if _quartz is not None:
     # name -> (down event, up event, drag event, button constant)
     _MAC_BTN = {
@@ -227,8 +241,38 @@ def inject_mouse_scroll(dx: float, dy: float) -> None:
         _injecting.clear()
 
 
+def _track_shift(key_data: dict, down: bool) -> None:
+    global _shift_down
+    if key_data.get("kind") == "special" and key_data.get("name") in _SHIFT_NAMES:
+        _shift_down = down
+
+
+def _resolve_press(key_data: dict) -> dict:
+    """When Shift is held, map a base symbol to its shifted form (US layout)."""
+    if key_data.get("kind") != "char":
+        return key_data
+    ch = key_data["char"]
+    if _shift_down and ch in _SHIFT_MAP:
+        shifted = _SHIFT_MAP[ch]
+        _remapped_chars[ch] = shifted
+        return {"kind": "char", "char": shifted}
+    return key_data
+
+
+def _resolve_release(key_data: dict) -> dict:
+    """Release the same character we pressed (in case Shift changed meanwhile)."""
+    if key_data.get("kind") != "char":
+        return key_data
+    ch = key_data["char"]
+    shifted = _remapped_chars.pop(ch, None)
+    if shifted is not None:
+        return {"kind": "char", "char": shifted}
+    return key_data
+
+
 def inject_key_press(key_data: dict) -> None:
-    key = deserialize_key(key_data)
+    _track_shift(key_data, down=True)
+    key = deserialize_key(_resolve_press(key_data))
     if key is None:
         return
     _injecting.set()
@@ -239,7 +283,8 @@ def inject_key_press(key_data: dict) -> None:
 
 
 def inject_key_release(key_data: dict) -> None:
-    key = deserialize_key(key_data)
+    _track_shift(key_data, down=False)
+    key = deserialize_key(_resolve_release(key_data))
     if key is None:
         return
     _injecting.set()
