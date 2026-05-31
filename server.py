@@ -439,6 +439,8 @@ async def _broadcast_clipboard(text: str, exclude_ip: Optional[str] = None) -> N
 
 def _on_local_clipboard(text: str) -> None:
     """Clipboard monitor thread: our own clipboard changed → push to all clients."""
+    print(f"[server] clipboard changed locally ({len(text)} chars) "
+          f"→ broadcasting to {len(clients)} client(s)")
     _run_coroutine_threadsafe(_broadcast_clipboard(text))
 
 
@@ -567,6 +569,8 @@ async def ws_client_endpoint(websocket: WebSocket):
             elif msg.get("type") == "clipboard":
                 # Apply locally, then fan out to every OTHER client.
                 text = msg.get("text", "")
+                print(f"[server] clipboard from {client_ip} ({len(text)} chars) "
+                      f"→ applying locally + relaying")
                 clipboard_sync.apply_remote(text)
                 await _broadcast_clipboard(text, exclude_ip=client_ip)
 

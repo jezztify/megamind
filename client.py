@@ -85,8 +85,11 @@ if _quartz is not None:
 
 def _on_local_clipboard(text: str) -> None:
     """Clipboard monitor thread: local clipboard changed → send to server."""
-    if _loop is not None and _ws_connection is not None:
-        asyncio.run_coroutine_threadsafe(_send_clipboard(text), _loop)
+    if _loop is None or _ws_connection is None:
+        print(f"[client] clipboard changed but not connected — not sending")
+        return
+    print(f"[client] clipboard changed locally ({len(text)} chars) → sending")
+    asyncio.run_coroutine_threadsafe(_send_clipboard(text), _loop)
 
 
 async def _send_clipboard(text: str) -> None:
@@ -95,8 +98,8 @@ async def _send_clipboard(text: str) -> None:
         return
     try:
         await ws.send(json.dumps({"type": "clipboard", "text": text}))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[client] clipboard send failed: {e}")
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -324,7 +327,9 @@ async def handle_message(raw: str, ws) -> None:
         inject_key_release(msg["key"])
 
     elif mtype == "clipboard":
-        clipboard_sync.apply_remote(msg.get("text", ""))
+        text = msg.get("text", "")
+        print(f"[client] clipboard received from server ({len(text)} chars) → applying")
+        clipboard_sync.apply_remote(text)
 
     elif mtype == "set_active":
         global _edge_monitor_task
