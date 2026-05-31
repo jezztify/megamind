@@ -1,0 +1,7 @@
+fastapi
+uvicorn[standard]
+websockets
+pynput
+pyperclip
+# macOS only: smooth mouse injection without cursor snap-back
+pyobjc-framework-Quartz; sys_platform == "darwin"

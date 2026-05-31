@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MegaMind — Mouse/Keyboard Sharing</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, sans-serif;
+      background: #1a1a2e;
+      color: #e0e0e0;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* ---- Header ---- */
+    header {
+      background: #16213e;
+      border-bottom: 1px solid #0f3460;
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+    }
+    header h1 {
+      font-size: 1.3rem;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: #e94560;
+    }
+    #conn-badge {
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: #333;
+      color: #aaa;
+      transition: background 0.3s, color 0.3s;
+    }
+    #conn-badge.connected    { background: #0f3460; color: #4ade80; }
+    #conn-badge.disconnected { background: #3a1a1a; color: #f87171; }
+
+    .spacer { flex: 1; }
+
+    #active-label {
+      font-size: 0.85rem;
+      color: #94a3b8;
+    }
+    #active-machine {
+      font-weight: 700;
+      color: #e94560;
+    }
+
+    /* ---- Main layout ---- */
+    main {
+      flex: 1;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+
+    .hint {
+      font-size: 0.82rem;
+      color: #64748b;
+      text-align: center;
+    }
+
+    /* ---- Workspace (3x3 snap grid) ---- */
+    #workspace {
+      position: relative;
+      width: 450px;
+      height: 300px;
+      background: #0d1b2a;
+      border: 1px solid #0f3460;
+      border-radius: 10px;
+      margin: 0 auto;
+      overflow: hidden;
+    }
+
+    /* ---- Grid cells (snap targets) ---- */
+    .grid-cell {
+      position: absolute;
+      width: 150px;
+      height: 100px;
+      border: 1px dashed rgba(255,255,255,0.07);
+      box-sizing: border-box;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      pointer-events: none;
+    }
+    .grid-cell.drop-target {
+      background: rgba(74,222,128,0.10);
+      border-color: rgba(74,222,128,0.5);
+    }
+    .grid-cell .cell-hint {
+      font-size: 0.6rem;
+      color: rgba(255,255,255,0.12);
+      letter-spacing: 0.04em;
+    }
+
+    /* ---- Machine cards ---- */
+    .machine-card {
+      position: absolute;
+      width: 120px;
+      height: 70px;
+      background: #16213e;
+      border: 2px solid #0f3460;
+      border-radius: 8px;
+      cursor: grab;
+      user-select: none;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 4px;
+      transition: left 0.12s ease, top 0.12s ease, border-color 0.2s, box-shadow 0.2s;
+      padding: 6px;
+      z-index: 1;
+    }
+    .machine-card.dragging { transition: border-color 0.2s, box-shadow 0.2s; z-index: 10; }
+    .machine-card:active { cursor: grabbing; }
+    .machine-card.active-card {
+      border-color: #e94560;
+      box-shadow: 0 0 12px rgba(233,69,96,0.4);
+    }
+    .machine-card:hover:not(.active-card) {
+      border-color: #4ade80;
+      box-shadow: 0 0 8px rgba(74,222,128,0.2);
+    }
+
+    .card-ip {
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: #cbd5e1;
+      text-align: center;
+      word-break: break-all;
+    }
+
+    .status-row {
+      display: flex;
+      align-items: center;
+      gap: 5px;
+    }
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #4ade80;
+    }
+    .status-dot.offline { background: #f87171; }
+
+    .status-text {
+      font-size: 0.65rem;
+      color: #64748b;
+    }
+
+    .active-badge {
+      font-size: 0.6rem;
+      font-weight: 700;
+      background: #e94560;
+      color: #fff;
+      padding: 1px 6px;
+      border-radius: 4px;
+      letter-spacing: 0.05em;
+    }
+
+    /* ---- Client list below workspace ---- */
+    #client-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-width: 600px;
+      margin: 0 auto;
+      width: 100%;
+    }
+
+    .client-row {
+      background: #16213e;
+      border: 1px solid #0f3460;
+      border-radius: 8px;
+      padding: 10px 14px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 0.82rem;
+    }
+    .client-row .dot {
+      width: 10px; height: 10px;
+      border-radius: 50%;
+      background: #4ade80;
+      flex-shrink: 0;
+    }
+    .client-row .ip { font-weight: 600; flex: 1; }
+    .client-row .dims { color: #64748b; }
+    .client-row .force-btn {
+      background: #0f3460;
+      color: #93c5fd;
+      border: none;
+      padding: 4px 10px;
+      border-radius: 5px;
+      cursor: pointer;
+      font-size: 0.75rem;
+      transition: background 0.2s;
+    }
+    .client-row .force-btn:hover { background: #1e4d8c; }
+
+    #no-clients {
+      color: #475569;
+      font-size: 0.82rem;
+      text-align: center;
+      padding: 12px;
+    }
+  </style>
+</head>
+<body>
+
+<header>
+  <h1>MegaMind</h1>
+  <span id="conn-badge" class="disconnected">Disconnected</span>
+  <div class="spacer"></div>
+  <span id="active-label">Active: <span id="active-machine">—</span></span>
+</header>
+
+<main>
+  <p class="hint">Drag machines into the 3&times;3 grid to arrange them. Adjacent cells become left/right/top/bottom neighbors. Click a machine to force-switch.</p>
+
+  <div id="workspace"></div>
+
+  <div id="client-list">
+    <p id="no-clients">No clients connected yet.</p>
+  </div>
+</main>
+
+<script>
+// ============================================================
+// State
+// ============================================================
+let state = {
+  active: 'server',
+  server_ip: 'server',
+  clients: {},       // ip -> { screen_width, screen_height }
+  layout: {},
+  screen_width: 0,
+  screen_height: 0,
+};
+
+// Card positions in workspace { id -> { x, y } }
+const positions = {};
+
+// ============================================================
+// WebSocket
+// ============================================================
+let ws = null;
+
+function connect() {
+  const url = `ws://${location.host}/ws/ui`;
+  ws = new WebSocket(url);
+
+  ws.onopen = () => {
+    setBadge('connected', 'Connected');
+  };
+
+  ws.onclose = () => {
+    setBadge('disconnected', 'Disconnected');
+    setTimeout(connect, 3000);
+  };
+
+  ws.onerror = () => {
+    ws.close();
+  };
+
+  ws.onmessage = (evt) => {
+    try {
+      const msg = JSON.parse(evt.data);
+      if (msg.type === 'state') {
+        applyState(msg);
+      }
+    } catch (e) {
+      console.error('WS parse error', e);
+    }
+  };
+}
+
+function sendMsg(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+
+function setBadge(cls, text) {
+  const el = document.getElementById('conn-badge');
+  el.className = cls;
+  el.textContent = text;
+}
+
+// ============================================================
+// State application
+// ============================================================
+function applyState(msg) {
+  state = {
+    active: msg.active,
+    server_ip: msg.server_ip,
+    clients: msg.clients || {},
+    layout: msg.layout || {},
+    screen_width: msg.screen_width,
+    screen_height: msg.screen_height,
+  };
+
+  const activeLabel = state.active === 'server' ? `server (${state.server_ip})` : state.active;
+  document.getElementById('active-machine').textContent = activeLabel;
+
+  renderWorkspace();
+  renderClientList();
+}
+
+// ============================================================
+// Workspace rendering — 3x3 snap grid
+// ============================================================
+const GRID = 3;
+const CELL_W = 150;
+const CELL_H = 100;
+const CARD_W = 120;
+const CARD_H = 70;
+const WS_W = GRID * CELL_W;   // 450
+const WS_H = GRID * CELL_H;   // 300
+
+// positions[id] = { r, c }  — which grid cell the machine occupies.
+// Default fill order around the centered server: right, left, top, bottom, corners.
+const DEFAULT_CELLS = [
+  { r: 1, c: 2 }, { r: 1, c: 0 }, { r: 0, c: 1 }, { r: 2, c: 1 },
+  { r: 0, c: 0 }, { r: 0, c: 2 }, { r: 2, c: 0 }, { r: 2, c: 2 },
+];
+
+function cellOccupant(r, c, exceptId) {
+  for (const id in positions) {
+    if (id === exceptId) continue;
+    if (positions[id].r === r && positions[id].c === c) return id;
+  }
+  return null;
+}
+
+function firstFreeCell() {
+  for (const cell of DEFAULT_CELLS) {
+    if (!cellOccupant(cell.r, cell.c, null)) return cell;
+  }
+  return { r: 1, c: 1 };
+}
+
+function cellToPixel(r, c) {
+  return {
+    left: c * CELL_W + (CELL_W - CARD_W) / 2,
+    top:  r * CELL_H + (CELL_H - CARD_H) / 2,
+  };
+}
+
+function ensureGridCells(ws_div) {
+  if (ws_div.querySelector('.grid-cell')) return;
+  const labels = {
+    '0,1': 'TOP', '1,0': 'LEFT', '1,2': 'RIGHT', '2,1': 'BOTTOM',
+  };
+  for (let r = 0; r < GRID; r++) {
+    for (let c = 0; c < GRID; c++) {
+      const cell = document.createElement('div');
+      cell.className = 'grid-cell';
+      cell.dataset.r = r;
+      cell.dataset.c = c;
+      cell.style.left = `${c * CELL_W}px`;
+      cell.style.top = `${r * CELL_H}px`;
+      const hint = labels[`${r},${c}`];
+      if (hint) cell.innerHTML = `<span class="cell-hint">${hint}</span>`;
+      ws_div.appendChild(cell);
+    }
+  }
+}
+
+function renderWorkspace() {
+  const ws_div = document.getElementById('workspace');
+  ensureGridCells(ws_div);
+
+  const allIds = ['server', ...Object.keys(state.clients)];
+
+  // Server defaults to the center cell.
+  if (!positions['server']) positions['server'] = { r: 1, c: 1 };
+
+  // New clients snap into the next free cell, and get a default layout so edge
+  // switching works immediately without the user having to arrange anything.
+  let newClient = false;
+  Object.keys(state.clients).forEach(ip => {
+    if (!positions[ip]) {
+      positions[ip] = firstFreeCell();
+      newClient = true;
+    }
+  });
+  if (newClient) setTimeout(computeAndSendLayout, 0);
+
+  // Remove cards for machines that are gone.
+  ws_div.querySelectorAll('.machine-card').forEach(card => {
+    if (!allIds.includes(card.dataset.id)) {
+      card.remove();
+      delete positions[card.dataset.id];
+    }
+  });
+
+  // Create or update cards.
+  allIds.forEach(id => {
+    let card = ws_div.querySelector(`.machine-card[data-id="${CSS.escape(id)}"]`);
+    if (!card) {
+      card = createCard(id);
+      ws_div.appendChild(card);
+    }
+    updateCard(card, id);
+  });
+}
+
+function createCard(id) {
+  const card = document.createElement('div');
+  card.className = 'machine-card';
+  card.dataset.id = id;
+
+  card.innerHTML = `
+    <div class="card-ip"></div>
+    <div class="status-row">
+      <div class="status-dot"></div>
+      <span class="status-text">online</span>
+    </div>
+    <div class="active-badge" style="display:none">ACTIVE</div>
+  `;
+
+  makeDraggable(card);
+
+  card.addEventListener('click', (e) => {
+    if (card._dragged) return;
+    const target = id === 'server' ? 'server' : id;
+    sendMsg({ type: 'force_switch', target });
+  });
+
+  return card;
+}
+
+function updateCard(card, id) {
+  const label = id === 'server' ? `server\n(${state.server_ip})` : id;
+  card.querySelector('.card-ip').textContent = label;
+
+  const isActive = state.active === id;
+  card.classList.toggle('active-card', isActive);
+  const badge = card.querySelector('.active-badge');
+  badge.style.display = isActive ? '' : 'none';
+
+  if (!card.classList.contains('dragging')) {
+    const pos = positions[id];
+    const px = cellToPixel(pos.r, pos.c);
+    card.style.left = `${px.left}px`;
+    card.style.top  = `${px.top}px`;
+  }
+}
+
+// ============================================================
+// Drag logic — free movement while dragging, snap to nearest cell on drop
+// ============================================================
+function nearestCell(leftPx, topPx) {
+  const cx = leftPx + CARD_W / 2;
+  const cy = topPx + CARD_H / 2;
+  const c = clamp(Math.floor(cx / CELL_W), 0, GRID - 1);
+  const r = clamp(Math.floor(cy / CELL_H), 0, GRID - 1);
+  return { r, c };
+}
+
+function makeDraggable(card) {
+  let startX, startY, origLeft, origTop;
+
+  card.addEventListener('mousedown', (e) => {
+    e.preventDefault();
+    card._dragged = false;
+    startX = e.clientX;
+    startY = e.clientY;
+    const id = card.dataset.id;
+    const px = cellToPixel(positions[id].r, positions[id].c);
+    origLeft = px.left;
+    origTop = px.top;
+    card.classList.add('dragging');
+
+    function highlight(r, c) {
+      document.querySelectorAll('.grid-cell.drop-target')
+        .forEach(el => el.classList.remove('drop-target'));
+      const cell = document.querySelector(`.grid-cell[data-r="${r}"][data-c="${c}"]`);
+      if (cell) cell.classList.add('drop-target');
+    }
+
+    function onMove(ev) {
+      const dx = ev.clientX - startX;
+      const dy = ev.clientY - startY;
+      if (Math.abs(dx) > 3 || Math.abs(dy) > 3) card._dragged = true;
+
+      const left = clamp(origLeft + dx, 0, WS_W - CARD_W);
+      const top = clamp(origTop + dy, 0, WS_H - CARD_H);
+      card.style.left = `${left}px`;
+      card.style.top = `${top}px`;
+
+      const target = nearestCell(left, top);
+      highlight(target.r, target.c);
+    }
+
+    function onUp() {
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('mouseup', onUp);
+      card.classList.remove('dragging');
+      document.querySelectorAll('.grid-cell.drop-target')
+        .forEach(el => el.classList.remove('drop-target'));
+
+      if (card._dragged) {
+        const left = parseFloat(card.style.left);
+        const top = parseFloat(card.style.top);
+        snapToCell(id, nearestCell(left, top));
+      } else {
+        updateCard(card, id);  // no real drag: settle back into place
+      }
+    }
+
+    document.addEventListener('mousemove', onMove);
+    document.addEventListener('mouseup', onUp);
+  });
+}
+
+// Move a machine into a cell. If occupied, swap with the current occupant.
+function snapToCell(id, cell) {
+  const occupant = cellOccupant(cell.r, cell.c, id);
+  const from = { r: positions[id].r, c: positions[id].c };
+  positions[id] = { r: cell.r, c: cell.c };
+  if (occupant) positions[occupant] = from;  // swap
+  renderWorkspace();
+  computeAndSendLayout();
+}
+
+// ============================================================
+// Layout derivation — straight from grid adjacency
+// ============================================================
+function machineAt(r, c) {
+  for (const id in positions) {
+    if (positions[id].r === r && positions[id].c === c) return id;
+  }
+  return null;
+}
+
+function computeAndSendLayout() {
+  const newLayout = {};
+  const allIds = ['server', ...Object.keys(state.clients)];
+  const NEIGHBORS = {
+    left:   [0, -1],
+    right:  [0, 1],
+    top:    [-1, 0],
+    bottom: [1, 0],
+  };
+
+  allIds.forEach(id => {
+    const pos = positions[id];
+    if (!pos) return;
+    for (const dir in NEIGHBORS) {
+      const [dr, dc] = NEIGHBORS[dir];
+      const neighbor = machineAt(pos.r + dr, pos.c + dc);
+      if (neighbor) {
+        if (!newLayout[id]) newLayout[id] = {};
+        newLayout[id][dir] = neighbor;
+      }
+    }
+  });
+
+  sendMsg({ type: 'layout_update', layout: newLayout });
+}
+
+// ============================================================
+// Client list below workspace
+// ============================================================
+function renderClientList() {
+  const container = document.getElementById('client-list');
+  const noClients = document.getElementById('no-clients');
+
+  // Remove old rows
+  container.querySelectorAll('.client-row').forEach(r => r.remove());
+
+  const clientKeys = Object.keys(state.clients);
+  noClients.style.display = clientKeys.length === 0 ? '' : 'none';
+
+  clientKeys.forEach(ip => {
+    const info = state.clients[ip];
+    const row = document.createElement('div');
+    row.className = 'client-row';
+
+    const isActive = state.active === ip;
+    row.innerHTML = `
+      <div class="dot"></div>
+      <span class="ip">${escapeHtml(ip)}</span>
+      <span class="dims">${info.screen_width}x${info.screen_height}</span>
+      ${isActive ? '<span style="color:#e94560;font-weight:700;font-size:0.75rem">ACTIVE</span>' : ''}
+      <button class="force-btn" data-ip="${escapeHtml(ip)}">Switch</button>
+    `;
+
+    row.querySelector('.force-btn').addEventListener('click', () => {
+      sendMsg({ type: 'force_switch', target: ip });
+    });
+
+    container.appendChild(row);
+  });
+
+  // Server row
+  const serverRow = document.createElement('div');
+  serverRow.className = 'client-row';
+  const serverActive = state.active === 'server';
+  serverRow.innerHTML = `
+    <div class="dot"></div>
+    <span class="ip">server (${escapeHtml(state.server_ip)})</span>
+    <span class="dims">${state.screen_width}x${state.screen_height}</span>
+    ${serverActive ? '<span style="color:#e94560;font-weight:700;font-size:0.75rem">ACTIVE</span>' : ''}
+    <button class="force-btn" data-ip="server">Switch</button>
+  `;
+  serverRow.querySelector('.force-btn').addEventListener('click', () => {
+    sendMsg({ type: 'force_switch', target: 'server' });
+  });
+  container.insertBefore(serverRow, container.firstChild);
+}
+
+// ============================================================
+// Utilities
+// ============================================================
+function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+// ============================================================
+// Init
+// ============================================================
+connect();
+</script>
+</body>
+</html>
