@@ -6,8 +6,10 @@ Usage:
 """
 
 import asyncio
+import ipaddress
 import json
 import platform
+import socket
 import sys
 import threading
 import time
@@ -482,15 +484,100 @@ async def run(server_url: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Server discovery
+# ---------------------------------------------------------------------------
+
+SERVER_PORT: int = 8080
+
+
+async def _probe(ip: str, timeout: float = 0.35) -> str | None:
+    """Return ip if port SERVER_PORT is open, else None."""
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, SERVER_PORT), timeout=timeout
+        )
+        writer.close()
+        try:
+            await writer.wait_closed()
+        except Exception:
+            pass
+        return ip
+    except Exception:
+        return None
+
+
+async def _scan_subnet() -> list[str]:
+    """Concurrently probe every host on the local /24 subnet."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        return []
+
+    network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+    tasks = [_probe(str(h)) for h in network.hosts() if str(h) != local_ip]
+    results = await asyncio.gather(*tasks)
+    return [ip for ip in results if ip is not None]
+
+
+def select_server() -> str:
+    """Scan the local network, list found servers, and return the chosen URL.
+
+    If a URL is passed on the command line it is used directly without prompting.
+    """
+    print("Scanning local network for MegaMind servers...")
+    found: list[str] = asyncio.run(_scan_subnet())
+
+    print()
+    if found:
+        print(f"Found {len(found)} server(s):")
+        for i, ip in enumerate(found, 1):
+            print(f"  [{i}] http://{ip}:{SERVER_PORT}")
+    else:
+        print("No servers found on the local /24 subnet.")
+    print(f"  [0] Enter address manually")
+    print()
+
+    while True:
+        try:
+            raw = input("Select [0]: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            raise SystemExit(0)
+
+        if raw == "" or raw == "0":
+            try:
+                addr = input("Server IP or URL: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                raise SystemExit(0)
+            if not addr:
+                continue
+            if not addr.startswith("http"):
+                addr = f"http://{addr}:{SERVER_PORT}"
+            return addr
+
+        try:
+            idx = int(raw) - 1
+            if 0 <= idx < len(found):
+                return f"http://{found[idx]}:{SERVER_PORT}"
+        except ValueError:
+            pass
+
+        print(f"  Enter a number between 0 and {len(found)}.")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python client.py http://<server-ip>:8080")
-        sys.exit(1)
-
-    server_url = sys.argv[1]
+    if len(sys.argv) >= 2:
+        server_url = sys.argv[1]
+    else:
+        server_url = select_server()
 
     try:
         asyncio.run(run(server_url))
