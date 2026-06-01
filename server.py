@@ -9,8 +9,10 @@ Web UI:  http://<this-machine-ip>:8080
 
 import asyncio
 import json
+import os
 import platform
 import socket
+import sys
 import threading
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -18,6 +20,13 @@ from typing import Optional
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
+
+
+def _resource_path(relative: str) -> str:
+    """Resolve a data file path that works both when running from source and when
+    frozen by PyInstaller (sys._MEIPASS is the temp-extracted bundle root)."""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, relative)
 
 import screens
 import clipboard_sync
@@ -523,7 +532,7 @@ app = FastAPI(lifespan=lifespan)
 
 @app.get("/")
 async def serve_ui():
-    return FileResponse("static/index.html")
+    return FileResponse(_resource_path("static/index.html"))
 
 
 @app.websocket("/ws/client")
