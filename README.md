@@ -4,6 +4,7 @@ Control multiple computers (Windows + macOS) with a single keyboard and mouse ov
 
 Move your mouse off the edge of the server's screen and it appears on another machine. Keyboard, mouse, and the text clipboard follow. Arrange machines visually in a 3×3 grid from any browser.
 
+Vibe-coded using Claude Sonnet 4.6/Opus 4.8.
 ---
 
 ## How it works
@@ -36,6 +37,42 @@ Move your mouse off the edge of the server's screen and it appears on another ma
 - **Multi-monitor aware** — uses the full virtual desktop (all monitors), including monitors positioned left/above the primary.
 - **Web control panel** — 3×3 snap grid to arrange machines; click a machine to force-switch to it.
 - **Auto-discovery** — clients self-register by IP; no manual naming.
+
+---
+
+## Pre-built executables
+
+If you don't want to install Python, grab the standalone binaries from the `dist/` folder:
+
+| File | Platform | Role |
+|---|---|---|
+| `MegaMind_Server.exe` | Windows | Server — run on the machine with your keyboard/mouse |
+| `MegaMind_Client.exe` | Windows / macOS | Client — run on every other machine |
+
+### Server (Windows)
+
+```powershell
+.\dist\MegaMind_Server.exe
+```
+
+No arguments needed. It auto-detects your LAN IP and starts on port 8080.
+
+### Client (Windows / macOS)
+
+```powershell
+.\dist\MegaMind_Client.exe http://<server-ip>:8080
+```
+
+Replace `<server-ip>` with the IP printed by the server on startup.
+
+> **macOS:** Grant **Accessibility** permission to the terminal or app bundle that runs the executable (`System Settings → Privacy & Security → Accessibility`), then re-run.
+
+> **Windows firewall:** Allow inbound port 8080 on the server machine (one-time, elevated PowerShell):
+> ```powershell
+> New-NetFirewallRule -DisplayName "MegaMind" -Direction Inbound -Protocol TCP -LocalPort 8080 -Action Allow
+> ```
+
+Once both are running, open `http://<server-ip>:8080` in any browser and arrange your machines in the grid.
 
 ---
 

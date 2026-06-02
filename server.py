@@ -121,11 +121,19 @@ def get_local_ip() -> str:
         return "127.0.0.1"
 
 
+# VK_NUMPAD0–VK_NUMPAD9 (96–105), VK_MULTIPLY (106), VK_ADD (107),
+# VK_SEPARATOR (108), VK_SUBTRACT (109), VK_DECIMAL (110), VK_DIVIDE (111)
+_NUMPAD_VKS = frozenset(range(96, 112))
+
+
 def serialize_key(key) -> dict:
+    vk = getattr(key, "vk", None)
+    if vk is not None and vk in _NUMPAD_VKS:
+        return {"kind": "vk", "vk": vk}
     if hasattr(key, "char") and key.char is not None:
         return {"kind": "char", "char": key.char}
-    elif hasattr(key, "vk") and key.vk is not None:
-        return {"kind": "vk", "vk": key.vk}
+    elif vk is not None:
+        return {"kind": "vk", "vk": vk}
     elif hasattr(key, "name") and key.name is not None:
         return {"kind": "special", "name": key.name}
     return {"kind": "unknown"}
