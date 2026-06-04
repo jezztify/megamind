@@ -35,6 +35,20 @@ if platform.system() == "Darwin":
     except ImportError:
         pass
 
+# macOS: prefer a real virtual-HID keyboard (Karabiner DriverKit) when present.
+# Its events enter at the HID layer — they highlight on the Accessibility
+# Keyboard, fire Mission Control / Space-switch shortcuts natively, and work in
+# secure input fields, none of which synthetic Quartz/pynput key events do.
+# If the driver isn't installed, _vhid stays None and we fall back to pynput.
+_vhid = None
+if platform.system() == "Darwin":
+    try:
+        import virtual_hid_mac as _vhid
+        if not _vhid.available():
+            _vhid = None
+    except Exception:
+        _vhid = None
+
 # ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
@@ -80,15 +94,6 @@ DOUBLE_CLICK_DIST: int = 6
 _shift_down: bool = False
 _remapped_chars: dict = {}     # base char -> injected char, for press/release symmetry
 _SHIFT_NAMES = {"shift", "shift_l", "shift_r"}
-_CTRL_NAMES = {"ctrl", "ctrl_l", "ctrl_r"}
-_ctrl_down: bool = False       # True while a forwarded Ctrl key is held
-
-# macOS virtual key codes for the arrow keys, used to inject the native
-# Ctrl+Arrow "switch Space" shortcut via Quartz (pynput's injection does not
-# reliably set the modifier flags Mission Control's shortcut handler expects).
-_MAC_VK_LEFT: int = 0x7B   # 123
-_MAC_VK_RIGHT: int = 0x7C  # 124
-_MAC_ARROW_VK = {"left": _MAC_VK_LEFT, "right": _MAC_VK_RIGHT}
 _SHIFT_MAP = {
     "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
     "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
@@ -173,26 +178,6 @@ def _mac_post(event_type, button_const, dx: int = 0, dy: int = 0,
     _quartz.CGEventPost(_quartz.kCGHIDEventTap, evt)
 
 
-def _mac_switch_desktop(direction: str) -> bool:
-    """Inject the native Ctrl+Arrow 'switch Space' shortcut via Quartz.
-
-    Returns True if the event was posted (macOS + Quartz), False otherwise so the
-    caller can fall back to normal key injection. Mission Control's shortcut
-    handler keys off the Control modifier FLAG on the arrow key event, which
-    pynput does not set reliably — so we post the keydown/keyup ourselves with
-    kCGEventFlagMaskControl on each event."""
-    if _quartz is None:
-        return False
-    vk = _MAC_ARROW_VK.get(direction)
-    if vk is None:
-        return False
-    for is_down in (True, False):
-        evt = _quartz.CGEventCreateKeyboardEvent(None, vk, is_down)
-        _quartz.CGEventSetFlags(evt, _quartz.kCGEventFlagMaskControl)
-        _quartz.CGEventPost(_quartz.kCGHIDEventTap, evt)
-    return True
-
-
 def _place_cursor(dx: int = 0, dy: int = 0) -> None:
     """Move the OS cursor to the tracked (_cur_x, _cur_y) position (no buttons)."""
     if _quartz is not None:
@@ -273,13 +258,9 @@ def inject_mouse_scroll(dx: float, dy: float) -> None:
 
 
 def _track_shift(key_data: dict, down: bool) -> None:
-    global _shift_down, _ctrl_down
-    if key_data.get("kind") == "special":
-        name = key_data.get("name")
-        if name in _SHIFT_NAMES:
-            _shift_down = down
-        elif name in _CTRL_NAMES:
-            _ctrl_down = down
+    global _shift_down
+    if key_data.get("kind") == "special" and key_data.get("name") in _SHIFT_NAMES:
+        _shift_down = down
 
 
 def _resolve_press(key_data: dict) -> dict:
@@ -306,16 +287,14 @@ def _resolve_release(key_data: dict) -> dict:
 
 
 def inject_key_press(key_data: dict) -> None:
+    # Real virtual-HID path (macOS w/ Karabiner driver): send the base physical
+    # key and let separately-forwarded modifiers (Ctrl/Shift/...) ride in the
+    # HID modifier byte. These are real key presses, so Ctrl+Arrow switches
+    # Spaces natively and no Shift/symbol pre-resolution is needed.
+    if _vhid is not None and _vhid.press(key_data):
+        return
+
     _track_shift(key_data, down=True)
-
-    # Ctrl+Left/Right → native macOS "switch Space". Inject it directly via
-    # Quartz with the Control flag set, which Mission Control recognizes; the
-    # plain pynput press below does not reliably trigger the Space switch.
-    if (_ctrl_down and key_data.get("kind") == "special"
-            and key_data.get("name") in _MAC_ARROW_VK):
-        if _mac_switch_desktop(key_data["name"]):
-            return
-
     key = deserialize_key(_resolve_press(key_data))
     if key is None:
         return
@@ -327,6 +306,9 @@ def inject_key_press(key_data: dict) -> None:
 
 
 def inject_key_release(key_data: dict) -> None:
+    if _vhid is not None and _vhid.release(key_data):
+        return
+
     _track_shift(key_data, down=False)
     key = deserialize_key(_resolve_release(key_data))
     if key is None:
@@ -466,12 +448,18 @@ async def run(server_url: str) -> None:
     else:
         backend = "pynput"
 
+    if _vhid is not None:
+        kbd_backend = "virtual HID (Karabiner DriverKit)"
+    else:
+        kbd_backend = backend
+
     print("=" * 60)
     print("MegaMind Client")
     print(f"  Local IP    : {local_ip}")
     print(f"  Desktop     : {screen_width}x{screen_height} @ ({v_min_x},{v_min_y})")
     print(f"  Server      : {server_url}")
-    print(f"  Inject mode : {backend}")
+    print(f"  Mouse inject: {backend}")
+    print(f"  Key inject  : {kbd_backend}")
     print()
 
     if platform.system() == "Darwin":
@@ -480,6 +468,11 @@ async def run(server_url: str) -> None:
         if _quartz is None:
             print("  WARNING: Quartz not installed — cursor will stutter/snap back.")
             print("           Fix:  pip install pyobjc-framework-Quartz")
+        if _vhid is None:
+            print("  NOTE: Virtual-HID keyboard not active — keys are synthetic")
+            print("        (Ctrl+Arrow won't switch Spaces, secure fields reject them).")
+            print("        Install + approve Karabiner-DriverKit-VirtualHIDDevice:")
+            print("        https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice")
     elif platform.system() == "Windows":
         print("  NOTE: Run as Administrator if input injection does not work.")
 
@@ -522,6 +515,10 @@ async def run(server_url: str) -> None:
         _ws_connection = None
         global active
         active = False
+        # Drop any keys the virtual HID device still holds so none stay stuck
+        # down after a mid-keystroke disconnect.
+        if _vhid is not None:
+            _vhid.release_all()
         await asyncio.sleep(3)
 
 
