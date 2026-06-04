@@ -57,6 +57,7 @@ if platform.system() == "Windows":
 # ---------------------------------------------------------------------------
 
 EDGE_MARGIN: int = 3          # pixels from screen edge to trigger a switch
+RECENTER_MARGIN: int = 200    # warp cursor back to center when this close to a screen edge
 PORT: int = 8080
 
 # ---------------------------------------------------------------------------
@@ -83,7 +84,16 @@ _mouse_out = mouse.Controller()
 _recentering: bool = False  # True while we warp the cursor back to center
 _last_x: int = 0            # last cursor pos, for computing clean per-event deltas
 _last_y: int = 0
-RECENTER_MARGIN: int = 200  # warp back to center when this close to a screen edge
+_ctrl_held: bool = False    # True while any Ctrl key is physically held
+_win_held: bool = False     # True while any Win (Cmd) key is physically held
+
+_ARROW_TO_DIR: dict[str, str] = {
+    "left": "left",
+    "right": "right",
+    "up": "top",
+    "down": "bottom",
+}
+
 _active_direction: str = "right"  # edge we crossed to reach the active client
 
 # When Raw Input is available (Windows) the mouse listener is SUPPRESSED while
@@ -130,12 +140,14 @@ def serialize_key(key) -> dict:
     vk = getattr(key, "vk", None)
     if vk is not None and vk in _NUMPAD_VKS:
         return {"kind": "vk", "vk": vk}
+    # Prefer name over vk: vk codes are platform-specific (Windows VK != macOS key code),
+    # but pynput key names ("left", "right", "ctrl_l" …) are cross-platform.
+    if hasattr(key, "name") and key.name is not None:
+        return {"kind": "special", "name": key.name}
     if hasattr(key, "char") and key.char is not None:
         return {"kind": "char", "char": key.char}
-    elif vk is not None:
+    if vk is not None:
         return {"kind": "vk", "vk": vk}
-    elif hasattr(key, "name") and key.name is not None:
-        return {"kind": "special", "name": key.name}
     return {"kind": "unknown"}
 
 
@@ -272,14 +284,53 @@ def on_scroll(x: int, y: int, dx: float, dy: float) -> None:
         _run_coroutine_threadsafe(_forward_mouse_scroll(x, y, dx, dy))
 
 
+_WIN_KEYS = (keyboard.Key.cmd, keyboard.Key.cmd_l, keyboard.Key.cmd_r)
+
+
 def on_press(key) -> None:
+    global _ctrl_held, _win_held
+    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+        _ctrl_held = True
+    if key in _WIN_KEYS:
+        _win_held = True
+
+    if _ctrl_held and _win_held and hasattr(key, "name") and key.name in _ARROW_TO_DIR:
+        _run_coroutine_threadsafe(_handle_switch_shortcut(_ARROW_TO_DIR[key.name]))
+        return  # consumed — don't forward to client
+
     if active != "server":
         _run_coroutine_threadsafe(_forward_key("key_press", key))
 
 
 def on_release(key) -> None:
+    global _ctrl_held, _win_held
+    if key in (keyboard.Key.ctrl_l, keyboard.Key.ctrl_r):
+        _ctrl_held = False
+    if key in _WIN_KEYS:
+        _win_held = False
+
     if active != "server":
         _run_coroutine_threadsafe(_forward_key("key_release", key))
+
+
+async def _handle_switch_shortcut(direction: str) -> None:
+    """CTRL+WIN+arrow shortcut: switch to a neighbour or back to server."""
+    global _switching
+    if _switching:
+        return
+
+    if active == "server":
+        target_ip = layout.get("server", {}).get(direction)
+        if target_ip and target_ip in clients:
+            _switching = True
+            await _switch_to(target_ip, direction)
+    else:
+        # Release Ctrl and Win keys on the client so none get stuck.
+        if active in clients:
+            ws = clients[active]["ws"]
+            for key_name in ("ctrl_l", "ctrl_r", "cmd", "cmd_l", "cmd_r"):
+                await _safe_send(ws, json.dumps({"type": "key_release", "key": {"kind": "special", "name": key_name}}))
+        await _switch_to_server(screen_width // 2, screen_height // 2)
 
 
 def _check_edges(x: int, y: int) -> None:
@@ -362,6 +413,7 @@ async def _switch_to(ip: str, direction: str) -> None:
         return
 
     await _set_input_mode(remote=True)
+    _switching = False
     await _broadcast_state()
 
 
@@ -392,6 +444,11 @@ async def _switch_to_server(cursor_x: int, cursor_y: int) -> None:
 
 async def _set_input_mode(remote: bool) -> None:
     """Reconfigure listeners for local vs remote control, off the event loop."""
+    global _ctrl_held, _win_held
+    # Reset modifier state on every mode switch so neither flag can get stuck
+    # across a listener restart (e.g. key held while listener was swapped out).
+    _ctrl_held = False
+    _win_held = False
     if remote:
         await _loop.run_in_executor(None, restart_mouse, mouse_suppress_when_remote())
         await _loop.run_in_executor(None, restart_keyboard, True)

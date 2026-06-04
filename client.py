@@ -80,6 +80,15 @@ DOUBLE_CLICK_DIST: int = 6
 _shift_down: bool = False
 _remapped_chars: dict = {}     # base char -> injected char, for press/release symmetry
 _SHIFT_NAMES = {"shift", "shift_l", "shift_r"}
+_CTRL_NAMES = {"ctrl", "ctrl_l", "ctrl_r"}
+_ctrl_down: bool = False       # True while a forwarded Ctrl key is held
+
+# macOS virtual key codes for the arrow keys, used to inject the native
+# Ctrl+Arrow "switch Space" shortcut via Quartz (pynput's injection does not
+# reliably set the modifier flags Mission Control's shortcut handler expects).
+_MAC_VK_LEFT: int = 0x7B   # 123
+_MAC_VK_RIGHT: int = 0x7C  # 124
+_MAC_ARROW_VK = {"left": _MAC_VK_LEFT, "right": _MAC_VK_RIGHT}
 _SHIFT_MAP = {
     "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
     "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
@@ -164,6 +173,26 @@ def _mac_post(event_type, button_const, dx: int = 0, dy: int = 0,
     _quartz.CGEventPost(_quartz.kCGHIDEventTap, evt)
 
 
+def _mac_switch_desktop(direction: str) -> bool:
+    """Inject the native Ctrl+Arrow 'switch Space' shortcut via Quartz.
+
+    Returns True if the event was posted (macOS + Quartz), False otherwise so the
+    caller can fall back to normal key injection. Mission Control's shortcut
+    handler keys off the Control modifier FLAG on the arrow key event, which
+    pynput does not set reliably — so we post the keydown/keyup ourselves with
+    kCGEventFlagMaskControl on each event."""
+    if _quartz is None:
+        return False
+    vk = _MAC_ARROW_VK.get(direction)
+    if vk is None:
+        return False
+    for is_down in (True, False):
+        evt = _quartz.CGEventCreateKeyboardEvent(None, vk, is_down)
+        _quartz.CGEventSetFlags(evt, _quartz.kCGEventFlagMaskControl)
+        _quartz.CGEventPost(_quartz.kCGHIDEventTap, evt)
+    return True
+
+
 def _place_cursor(dx: int = 0, dy: int = 0) -> None:
     """Move the OS cursor to the tracked (_cur_x, _cur_y) position (no buttons)."""
     if _quartz is not None:
@@ -244,9 +273,13 @@ def inject_mouse_scroll(dx: float, dy: float) -> None:
 
 
 def _track_shift(key_data: dict, down: bool) -> None:
-    global _shift_down
-    if key_data.get("kind") == "special" and key_data.get("name") in _SHIFT_NAMES:
-        _shift_down = down
+    global _shift_down, _ctrl_down
+    if key_data.get("kind") == "special":
+        name = key_data.get("name")
+        if name in _SHIFT_NAMES:
+            _shift_down = down
+        elif name in _CTRL_NAMES:
+            _ctrl_down = down
 
 
 def _resolve_press(key_data: dict) -> dict:
@@ -274,6 +307,15 @@ def _resolve_release(key_data: dict) -> dict:
 
 def inject_key_press(key_data: dict) -> None:
     _track_shift(key_data, down=True)
+
+    # Ctrl+Left/Right → native macOS "switch Space". Inject it directly via
+    # Quartz with the Control flag set, which Mission Control recognizes; the
+    # plain pynput press below does not reliably trigger the Space switch.
+    if (_ctrl_down and key_data.get("kind") == "special"
+            and key_data.get("name") in _MAC_ARROW_VK):
+        if _mac_switch_desktop(key_data["name"]):
+            return
+
     key = deserialize_key(_resolve_press(key_data))
     if key is None:
         return
