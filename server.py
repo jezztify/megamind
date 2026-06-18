@@ -36,6 +36,17 @@ screens.set_dpi_aware()
 
 from pynput import keyboard, mouse
 
+# macOS: use a direct Quartz CGEventTap for keyboard capture, which intercepts
+# key events BEFORE macOS processes system shortcuts (e.g. Ctrl+Arrow for Mission
+# Control). pynput's listener misses these because macOS consumes them first.
+_mac_kbd_capture = None
+if platform.system() == "Darwin":
+    try:
+        from keyboard_capture_mac import MacKeyboardCapture
+        _mac_kbd_capture = True  # sentinel: module available
+    except ImportError:
+        pass
+
 # Windows: capture true relative motion via Raw Input so the cursor can stay
 # suppressed (frozen, no click leak) while we still read movement.
 _rawinput = None
@@ -225,13 +236,25 @@ def restart_keyboard(suppress: bool) -> None:
                 pass
             _keyboard_listener = None
 
-        kl = keyboard.Listener(
-            on_press=on_press,
-            on_release=on_release,
-            suppress=suppress,
-        )
-        kl.start()
-        _keyboard_listener = kl
+        # On macOS with suppress, use the direct Quartz CGEventTap which
+        # intercepts ALL key events (including Ctrl+Arrow that macOS would
+        # otherwise consume for Mission Control space-switching).
+        if _mac_kbd_capture and suppress:
+            cap = MacKeyboardCapture(
+                on_press=on_press,
+                on_release=on_release,
+                suppress=True,
+            )
+            cap.start()
+            _keyboard_listener = cap
+        else:
+            kl = keyboard.Listener(
+                on_press=on_press,
+                on_release=on_release,
+                suppress=suppress,
+            )
+            kl.start()
+            _keyboard_listener = kl
 
 
 # ---------------------------------------------------------------------------
