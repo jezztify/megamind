@@ -39,6 +39,18 @@ Vibe-coded using Claude Sonnet 4.6/Opus 4.8.
 - **Web dashboard** — browser-based 3×3 snap grid to arrange machines; click a machine to force-switch to it.
 - **Auto-discovery** — clients self-register by IP; no manual naming.
 
+## Screenshots
+
+### Desktop control panel
+
+![MegaMind desktop control panel with the Server tab selected](docs/screenshots/control-panel.png)
+
+### Native placement editor
+
+![MegaMind native placement editor showing the server and sample client screens in a 3×3 grid](docs/screenshots/placement-editor.png)
+
+The placement screenshot uses sample device addresses; a live connection shows the machines registered with the selected server.
+
 ---
 
 ## Pre-built executables
