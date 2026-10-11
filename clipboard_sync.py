@@ -51,10 +51,15 @@ def apply_remote(text: str) -> None:
         pass
 
 
-def start_monitor(on_local_change, interval: float = 0.6):
-    """Begin watching the local clipboard. Returns the monitor Thread (daemon)."""
+def start_monitor(
+    on_local_change,
+    interval: float = 0.6,
+    stop_event: threading.Event | None = None,
+):
+    """Begin watching the clipboard until stopped; return its daemon thread."""
     if pyperclip is None:
         return None
+    stop_event = stop_event or threading.Event()
 
     def loop():
         global _shared
@@ -66,8 +71,7 @@ def start_monitor(on_local_change, interval: float = 0.6):
         except Exception:
             pass
 
-        while True:
-            time.sleep(interval)
+        while not stop_event.wait(interval):
             try:
                 cur = pyperclip.paste()
             except Exception:

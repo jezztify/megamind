@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "activeSetId": "default",
+  "sets": [
+    {
+      "id": "default",
+      "name": "Default"
+    }
+  ]
+}

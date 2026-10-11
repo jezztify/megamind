@@ -2,7 +2,7 @@
 MegaMind Client — runs on any machine that should be controlled from the server.
 
 Usage:
-    python client.py http://<server-ip>:8080
+    python client.py http://<server-ip>:9090
 """
 
 import asyncio
@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import time
+from typing import Callable
 
 import websockets
 from pynput import keyboard, mouse
@@ -26,6 +27,7 @@ import clipboard_sync
 
 EDGE_MARGIN: int = 3          # pixels from screen edge to trigger a return
 POLL_INTERVAL: float = 1 / 60  # 60 fps edge polling
+StatusCallback = Callable[[str, str], None]
 
 # macOS: use Quartz CGEventPost for smooth injection (avoids CGWarp snap-back)
 _quartz = None
@@ -77,6 +79,7 @@ screen_height: int = 0
 _ws_connection = None          # active websocket
 _edge_monitor_task: asyncio.Task | None = None
 _loop: asyncio.AbstractEventLoop | None = None  # for thread-safe clipboard sends
+_clipboard_monitor_started: bool = False
 
 # macOS mouse-button state, needed for proper drag + multi-click injection.
 _buttons_down: set = set()     # button names currently pressed
@@ -116,7 +119,6 @@ if _quartz is not None:
 def _on_local_clipboard(text: str) -> None:
     """Clipboard monitor thread: local clipboard changed → send to server."""
     if _loop is None or _ws_connection is None:
-        print(f"[client] clipboard changed but not connected — not sending")
         return
     print(f"[client] clipboard changed locally ({len(text)} chars) → sending")
     asyncio.run_coroutine_threadsafe(_send_clipboard(text), _loop)
@@ -373,7 +375,7 @@ async def edge_monitor_loop(ws) -> None:
 # ---------------------------------------------------------------------------
 
 async def handle_message(raw: str, ws) -> None:
-    global active, return_edge
+    global active, return_edge, _edge_monitor_task
 
     try:
         msg = json.loads(raw)
@@ -403,7 +405,6 @@ async def handle_message(raw: str, ws) -> None:
         clipboard_sync.apply_remote(text)
 
     elif mtype == "set_active":
-        global _edge_monitor_task
         entry_x = msg.get("entry_x", v_min_x + screen_width // 2)
         entry_y = msg.get("entry_y", v_min_y + screen_height // 2)
         return_edge = msg.get("return_edge", "left")
@@ -418,13 +419,93 @@ async def handle_message(raw: str, ws) -> None:
 
         _edge_monitor_task = asyncio.ensure_future(edge_monitor_loop(ws))
 
+    elif mtype == "set_inactive":
+        active = False
+        if _edge_monitor_task and not _edge_monitor_task.done():
+            _edge_monitor_task.cancel()
+        print("[client] No longer active")
+
 
 # ---------------------------------------------------------------------------
 # Main WebSocket loop
 # ---------------------------------------------------------------------------
 
-async def run(server_url: str) -> None:
+def _notify_status(callback: StatusCallback | None, status: str, detail: str = "") -> None:
+    if callback is None:
+        return
+    try:
+        callback(status, detail)
+    except Exception as e:
+        print(f"[client] Status callback failed: {e}")
+
+
+async def register_with_server(ws, registration: dict, timeout: float = 5.0) -> None:
+    """Register this client and reject WebSocket endpoints that are not MegaMind."""
+    await ws.send(json.dumps(registration))
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+    except asyncio.TimeoutError as e:
+        raise ConnectionError("server did not confirm MegaMind registration") from e
+
+    try:
+        response = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as e:
+        raise ConnectionError("server returned an invalid registration response") from e
+    if not isinstance(response, dict) or response.get("type") != "registered":
+        raise ConnectionError("endpoint is not a MegaMind server")
+
+
+async def _receive_client_messages(ws) -> None:
+    async for raw in ws:
+        await handle_message(raw, ws)
+
+
+async def _wait_for_stop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        await asyncio.sleep(0.1)
+
+
+async def _receive_until_stopped(ws, stop_event: threading.Event) -> bool:
+    """Receive server messages until disconnect, or close the socket on request."""
+    receiver = asyncio.create_task(_receive_client_messages(ws))
+    stopper = asyncio.create_task(_wait_for_stop(stop_event))
+    try:
+        done, _ = await asyncio.wait(
+            (receiver, stopper), return_when=asyncio.FIRST_COMPLETED
+        )
+        if stopper in done:
+            await ws.close()
+            if not receiver.done():
+                receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            return True
+        await receiver
+        return False
+    finally:
+        if not stopper.done():
+            stopper.cancel()
+        await asyncio.gather(stopper, return_exceptions=True)
+
+
+async def _retry_delay(stop_event: threading.Event | None, delay: float = 3.0) -> None:
+    if stop_event is None:
+        await asyncio.sleep(delay)
+        return
+    deadline = asyncio.get_running_loop().time() + delay
+    while not stop_event.is_set():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(0.1, remaining))
+
+
+async def run(
+    server_url: str,
+    stop_event: threading.Event | None = None,
+    on_status: StatusCallback | None = None,
+) -> None:
     global screen_width, screen_height, v_min_x, v_min_y, _loop
+    global _clipboard_monitor_started
 
     _loop = asyncio.get_running_loop()
     v_min_x, v_min_y, screen_width, screen_height = screens.get_virtual_bounds()
@@ -433,15 +514,7 @@ async def run(server_url: str) -> None:
     ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = ws_url.rstrip("/") + "/ws/client"
 
-    local_ip = None
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        local_ip = "unknown"
+    local_ip = _get_local_ip() or "unknown"
 
     if platform.system() == "Darwin":
         backend = "Quartz CGEvent (smooth)" if _quartz is not None else "pynput FALLBACK"
@@ -477,56 +550,99 @@ async def run(server_url: str) -> None:
         print("  NOTE: Run as Administrator if input injection does not work.")
 
     if clipboard_sync.available():
-        clipboard_sync.start_monitor(_on_local_clipboard)
+        if not _clipboard_monitor_started:
+            clipboard_sync.start_monitor(_on_local_clipboard)
+            _clipboard_monitor_started = True
         print("  Clipboard  : sync enabled")
     else:
         print("  Clipboard  : unavailable (pip install pyperclip)")
 
     print("=" * 60)
 
-    global _ws_connection
-    while True:
-        try:
-            print(f"[client] Connecting to {ws_url} ...")
-            async with websockets.connect(ws_url) as ws:
-                _ws_connection = ws
-                # Register
-                reg = json.dumps({
-                    "type": "register",
-                    "v_min_x": v_min_x,
-                    "v_min_y": v_min_y,
-                    "screen_width": screen_width,
-                    "screen_height": screen_height,
-                })
-                await ws.send(reg)
-                print("[client] Connected and registered.")
+    global _ws_connection, active
+    connected_once = False
+    try:
+        while stop_event is None or not stop_event.is_set():
+            _notify_status(on_status, "connecting", server_url)
+            try:
+                print(f"[client] Connecting to {ws_url} ...")
+                async with websockets.connect(ws_url) as ws:
+                    _ws_connection = ws
+                    registration = {
+                        "type": "register",
+                        "v_min_x": v_min_x,
+                        "v_min_y": v_min_y,
+                        "screen_width": screen_width,
+                        "screen_height": screen_height,
+                    }
+                    await register_with_server(ws, registration)
+                    connected_once = True
+                    _notify_status(on_status, "connected", server_url)
+                    print("[client] Connected and registered.")
 
-                # Message loop
-                async for raw in ws:
-                    await handle_message(raw, ws)
+                    if stop_event is None:
+                        await _receive_client_messages(ws)
+                    elif await _receive_until_stopped(ws, stop_event):
+                        break
+                    if stop_event is None or not stop_event.is_set():
+                        _notify_status(
+                            on_status,
+                            "disconnected" if connected_once else "failed",
+                            "server closed the WebSocket connection",
+                        )
 
-        except (websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.WebSocketException,
-                OSError) as e:
-            print(f"[client] Disconnected ({e}). Retrying in 3 seconds...")
-        except Exception as e:
-            print(f"[client] Unexpected error: {e}. Retrying in 3 seconds...")
+            except (websockets.exceptions.ConnectionClosed,
+                    websockets.exceptions.WebSocketException,
+                    OSError,
+                    ConnectionError,
+                    asyncio.TimeoutError) as e:
+                print(f"[client] Disconnected ({e}). Retrying in 3 seconds...")
+                if stop_event is None or not stop_event.is_set():
+                    _notify_status(
+                        on_status,
+                        "disconnected" if connected_once else "failed",
+                        str(e),
+                    )
+            except Exception as e:
+                print(f"[client] Unexpected error: {e}. Retrying in 3 seconds...")
+                if stop_event is None or not stop_event.is_set():
+                    _notify_status(
+                        on_status,
+                        "disconnected" if connected_once else "failed",
+                        str(e),
+                    )
+            finally:
+                _ws_connection = None
+                active = False
+                # Drop any keys the virtual HID device still holds so none stay
+                # stuck down after a mid-keystroke disconnect.
+                if _vhid is not None:
+                    _vhid.release_all()
 
+            if stop_event is not None and stop_event.is_set():
+                break
+            await _retry_delay(stop_event)
+    finally:
         _ws_connection = None
-        global active
         active = False
-        # Drop any keys the virtual HID device still holds so none stay stuck
-        # down after a mid-keystroke disconnect.
-        if _vhid is not None:
-            _vhid.release_all()
-        await asyncio.sleep(3)
+        _notify_status(on_status, "stopped", "")
 
 
 # ---------------------------------------------------------------------------
 # Server discovery
 # ---------------------------------------------------------------------------
 
-SERVER_PORT: int = 8080
+SERVER_PORT: int = 9090
+
+
+def _get_local_ip() -> str | None:
+    """Return the IPv4 address used for the default outbound route, if known."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
 
 
 async def _probe(ip: str, timeout: float = 0.35) -> str | None:
@@ -547,18 +663,19 @@ async def _probe(ip: str, timeout: float = 0.35) -> str | None:
 
 async def _scan_subnet() -> list[str]:
     """Concurrently probe every host on the local /24 subnet."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
+    local_ip = _get_local_ip()
+    if local_ip is None:
         return []
 
     network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
     tasks = [_probe(str(h)) for h in network.hosts() if str(h) != local_ip]
     results = await asyncio.gather(*tasks)
     return [ip for ip in results if ip is not None]
+
+
+async def scan_servers() -> list[str]:
+    """Find hosts on the current IPv4 /24 with MegaMind's TCP port open."""
+    return await _scan_subnet()
 
 
 def select_server() -> str:
