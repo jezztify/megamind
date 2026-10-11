@@ -2,7 +2,7 @@
 MegaMind Client — runs on any machine that should be controlled from the server.
 
 Usage:
-    python client.py http://<server-ip>:8080
+    python client.py http://<server-ip>:9090
 """
 
 import asyncio
@@ -13,6 +13,7 @@ import socket
 import sys
 import threading
 import time
+from typing import Callable
 
 import websockets
 from pynput import keyboard, mouse
@@ -26,6 +27,7 @@ import clipboard_sync
 
 EDGE_MARGIN: int = 3          # pixels from screen edge to trigger a return
 POLL_INTERVAL: float = 1 / 60  # 60 fps edge polling
+StatusCallback = Callable[[str, str], None]
 
 # macOS: use Quartz CGEventPost for smooth injection (avoids CGWarp snap-back)
 _quartz = None
@@ -34,6 +36,20 @@ if platform.system() == "Darwin":
         import Quartz as _quartz
     except ImportError:
         pass
+
+# macOS: prefer a real virtual-HID keyboard (Karabiner DriverKit) when present.
+# Its events enter at the HID layer — they highlight on the Accessibility
+# Keyboard, fire Mission Control / Space-switch shortcuts natively, and work in
+# secure input fields, none of which synthetic Quartz/pynput key events do.
+# If the driver isn't installed, _vhid stays None and we fall back to pynput.
+_vhid = None
+if platform.system() == "Darwin":
+    try:
+        import virtual_hid_mac as _vhid
+        if not _vhid.available():
+            _vhid = None
+    except Exception:
+        _vhid = None
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -63,6 +79,7 @@ screen_height: int = 0
 _ws_connection = None          # active websocket
 _edge_monitor_task: asyncio.Task | None = None
 _loop: asyncio.AbstractEventLoop | None = None  # for thread-safe clipboard sends
+_clipboard_monitor_started: bool = False
 
 # macOS mouse-button state, needed for proper drag + multi-click injection.
 _buttons_down: set = set()     # button names currently pressed
@@ -80,15 +97,6 @@ DOUBLE_CLICK_DIST: int = 6
 _shift_down: bool = False
 _remapped_chars: dict = {}     # base char -> injected char, for press/release symmetry
 _SHIFT_NAMES = {"shift", "shift_l", "shift_r"}
-_CTRL_NAMES = {"ctrl", "ctrl_l", "ctrl_r"}
-_ctrl_down: bool = False       # True while a forwarded Ctrl key is held
-
-# macOS virtual key codes for the arrow keys, used to inject the native
-# Ctrl+Arrow "switch Space" shortcut via Quartz (pynput's injection does not
-# reliably set the modifier flags Mission Control's shortcut handler expects).
-_MAC_VK_LEFT: int = 0x7B   # 123
-_MAC_VK_RIGHT: int = 0x7C  # 124
-_MAC_ARROW_VK = {"left": _MAC_VK_LEFT, "right": _MAC_VK_RIGHT}
 _SHIFT_MAP = {
     "1": "!", "2": "@", "3": "#", "4": "$", "5": "%",
     "6": "^", "7": "&", "8": "*", "9": "(", "0": ")",
@@ -111,7 +119,6 @@ if _quartz is not None:
 def _on_local_clipboard(text: str) -> None:
     """Clipboard monitor thread: local clipboard changed → send to server."""
     if _loop is None or _ws_connection is None:
-        print(f"[client] clipboard changed but not connected — not sending")
         return
     print(f"[client] clipboard changed locally ({len(text)} chars) → sending")
     asyncio.run_coroutine_threadsafe(_send_clipboard(text), _loop)
@@ -171,26 +178,6 @@ def _mac_post(event_type, button_const, dx: int = 0, dy: int = 0,
     if click_state:
         _quartz.CGEventSetIntegerValueField(evt, _quartz.kCGMouseEventClickState, click_state)
     _quartz.CGEventPost(_quartz.kCGHIDEventTap, evt)
-
-
-def _mac_switch_desktop(direction: str) -> bool:
-    """Inject the native Ctrl+Arrow 'switch Space' shortcut via Quartz.
-
-    Returns True if the event was posted (macOS + Quartz), False otherwise so the
-    caller can fall back to normal key injection. Mission Control's shortcut
-    handler keys off the Control modifier FLAG on the arrow key event, which
-    pynput does not set reliably — so we post the keydown/keyup ourselves with
-    kCGEventFlagMaskControl on each event."""
-    if _quartz is None:
-        return False
-    vk = _MAC_ARROW_VK.get(direction)
-    if vk is None:
-        return False
-    for is_down in (True, False):
-        evt = _quartz.CGEventCreateKeyboardEvent(None, vk, is_down)
-        _quartz.CGEventSetFlags(evt, _quartz.kCGEventFlagMaskControl)
-        _quartz.CGEventPost(_quartz.kCGHIDEventTap, evt)
-    return True
 
 
 def _place_cursor(dx: int = 0, dy: int = 0) -> None:
@@ -273,13 +260,9 @@ def inject_mouse_scroll(dx: float, dy: float) -> None:
 
 
 def _track_shift(key_data: dict, down: bool) -> None:
-    global _shift_down, _ctrl_down
-    if key_data.get("kind") == "special":
-        name = key_data.get("name")
-        if name in _SHIFT_NAMES:
-            _shift_down = down
-        elif name in _CTRL_NAMES:
-            _ctrl_down = down
+    global _shift_down
+    if key_data.get("kind") == "special" and key_data.get("name") in _SHIFT_NAMES:
+        _shift_down = down
 
 
 def _resolve_press(key_data: dict) -> dict:
@@ -306,16 +289,14 @@ def _resolve_release(key_data: dict) -> dict:
 
 
 def inject_key_press(key_data: dict) -> None:
+    # Real virtual-HID path (macOS w/ Karabiner driver): send the base physical
+    # key and let separately-forwarded modifiers (Ctrl/Shift/...) ride in the
+    # HID modifier byte. These are real key presses, so Ctrl+Arrow switches
+    # Spaces natively and no Shift/symbol pre-resolution is needed.
+    if _vhid is not None and _vhid.press(key_data):
+        return
+
     _track_shift(key_data, down=True)
-
-    # Ctrl+Left/Right → native macOS "switch Space". Inject it directly via
-    # Quartz with the Control flag set, which Mission Control recognizes; the
-    # plain pynput press below does not reliably trigger the Space switch.
-    if (_ctrl_down and key_data.get("kind") == "special"
-            and key_data.get("name") in _MAC_ARROW_VK):
-        if _mac_switch_desktop(key_data["name"]):
-            return
-
     key = deserialize_key(_resolve_press(key_data))
     if key is None:
         return
@@ -327,6 +308,9 @@ def inject_key_press(key_data: dict) -> None:
 
 
 def inject_key_release(key_data: dict) -> None:
+    if _vhid is not None and _vhid.release(key_data):
+        return
+
     _track_shift(key_data, down=False)
     key = deserialize_key(_resolve_release(key_data))
     if key is None:
@@ -391,7 +375,7 @@ async def edge_monitor_loop(ws) -> None:
 # ---------------------------------------------------------------------------
 
 async def handle_message(raw: str, ws) -> None:
-    global active, return_edge
+    global active, return_edge, _edge_monitor_task
 
     try:
         msg = json.loads(raw)
@@ -421,7 +405,6 @@ async def handle_message(raw: str, ws) -> None:
         clipboard_sync.apply_remote(text)
 
     elif mtype == "set_active":
-        global _edge_monitor_task
         entry_x = msg.get("entry_x", v_min_x + screen_width // 2)
         entry_y = msg.get("entry_y", v_min_y + screen_height // 2)
         return_edge = msg.get("return_edge", "left")
@@ -436,13 +419,93 @@ async def handle_message(raw: str, ws) -> None:
 
         _edge_monitor_task = asyncio.ensure_future(edge_monitor_loop(ws))
 
+    elif mtype == "set_inactive":
+        active = False
+        if _edge_monitor_task and not _edge_monitor_task.done():
+            _edge_monitor_task.cancel()
+        print("[client] No longer active")
+
 
 # ---------------------------------------------------------------------------
 # Main WebSocket loop
 # ---------------------------------------------------------------------------
 
-async def run(server_url: str) -> None:
+def _notify_status(callback: StatusCallback | None, status: str, detail: str = "") -> None:
+    if callback is None:
+        return
+    try:
+        callback(status, detail)
+    except Exception as e:
+        print(f"[client] Status callback failed: {e}")
+
+
+async def register_with_server(ws, registration: dict, timeout: float = 5.0) -> None:
+    """Register this client and reject WebSocket endpoints that are not MegaMind."""
+    await ws.send(json.dumps(registration))
+    try:
+        raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
+    except asyncio.TimeoutError as e:
+        raise ConnectionError("server did not confirm MegaMind registration") from e
+
+    try:
+        response = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as e:
+        raise ConnectionError("server returned an invalid registration response") from e
+    if not isinstance(response, dict) or response.get("type") != "registered":
+        raise ConnectionError("endpoint is not a MegaMind server")
+
+
+async def _receive_client_messages(ws) -> None:
+    async for raw in ws:
+        await handle_message(raw, ws)
+
+
+async def _wait_for_stop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        await asyncio.sleep(0.1)
+
+
+async def _receive_until_stopped(ws, stop_event: threading.Event) -> bool:
+    """Receive server messages until disconnect, or close the socket on request."""
+    receiver = asyncio.create_task(_receive_client_messages(ws))
+    stopper = asyncio.create_task(_wait_for_stop(stop_event))
+    try:
+        done, _ = await asyncio.wait(
+            (receiver, stopper), return_when=asyncio.FIRST_COMPLETED
+        )
+        if stopper in done:
+            await ws.close()
+            if not receiver.done():
+                receiver.cancel()
+            await asyncio.gather(receiver, return_exceptions=True)
+            return True
+        await receiver
+        return False
+    finally:
+        if not stopper.done():
+            stopper.cancel()
+        await asyncio.gather(stopper, return_exceptions=True)
+
+
+async def _retry_delay(stop_event: threading.Event | None, delay: float = 3.0) -> None:
+    if stop_event is None:
+        await asyncio.sleep(delay)
+        return
+    deadline = asyncio.get_running_loop().time() + delay
+    while not stop_event.is_set():
+        remaining = deadline - asyncio.get_running_loop().time()
+        if remaining <= 0:
+            return
+        await asyncio.sleep(min(0.1, remaining))
+
+
+async def run(
+    server_url: str,
+    stop_event: threading.Event | None = None,
+    on_status: StatusCallback | None = None,
+) -> None:
     global screen_width, screen_height, v_min_x, v_min_y, _loop
+    global _clipboard_monitor_started
 
     _loop = asyncio.get_running_loop()
     v_min_x, v_min_y, screen_width, screen_height = screens.get_virtual_bounds()
@@ -451,27 +514,25 @@ async def run(server_url: str) -> None:
     ws_url = server_url.replace("http://", "ws://").replace("https://", "wss://")
     ws_url = ws_url.rstrip("/") + "/ws/client"
 
-    local_ip = None
-    try:
-        import socket
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
-        local_ip = "unknown"
+    local_ip = _get_local_ip() or "unknown"
 
     if platform.system() == "Darwin":
         backend = "Quartz CGEvent (smooth)" if _quartz is not None else "pynput FALLBACK"
     else:
         backend = "pynput"
 
+    if _vhid is not None:
+        kbd_backend = "virtual HID (Karabiner DriverKit)"
+    else:
+        kbd_backend = backend
+
     print("=" * 60)
     print("MegaMind Client")
     print(f"  Local IP    : {local_ip}")
     print(f"  Desktop     : {screen_width}x{screen_height} @ ({v_min_x},{v_min_y})")
     print(f"  Server      : {server_url}")
-    print(f"  Inject mode : {backend}")
+    print(f"  Mouse inject: {backend}")
+    print(f"  Key inject  : {kbd_backend}")
     print()
 
     if platform.system() == "Darwin":
@@ -480,56 +541,108 @@ async def run(server_url: str) -> None:
         if _quartz is None:
             print("  WARNING: Quartz not installed — cursor will stutter/snap back.")
             print("           Fix:  pip install pyobjc-framework-Quartz")
+        if _vhid is None:
+            print("  NOTE: Virtual-HID keyboard not active — keys are synthetic")
+            print("        (Ctrl+Arrow won't switch Spaces, secure fields reject them).")
+            print("        Install + approve Karabiner-DriverKit-VirtualHIDDevice:")
+            print("        https://github.com/pqrs-org/Karabiner-DriverKit-VirtualHIDDevice")
     elif platform.system() == "Windows":
         print("  NOTE: Run as Administrator if input injection does not work.")
 
     if clipboard_sync.available():
-        clipboard_sync.start_monitor(_on_local_clipboard)
+        if not _clipboard_monitor_started:
+            clipboard_sync.start_monitor(_on_local_clipboard)
+            _clipboard_monitor_started = True
         print("  Clipboard  : sync enabled")
     else:
         print("  Clipboard  : unavailable (pip install pyperclip)")
 
     print("=" * 60)
 
-    global _ws_connection
-    while True:
-        try:
-            print(f"[client] Connecting to {ws_url} ...")
-            async with websockets.connect(ws_url) as ws:
-                _ws_connection = ws
-                # Register
-                reg = json.dumps({
-                    "type": "register",
-                    "v_min_x": v_min_x,
-                    "v_min_y": v_min_y,
-                    "screen_width": screen_width,
-                    "screen_height": screen_height,
-                })
-                await ws.send(reg)
-                print("[client] Connected and registered.")
+    global _ws_connection, active
+    connected_once = False
+    try:
+        while stop_event is None or not stop_event.is_set():
+            _notify_status(on_status, "connecting", server_url)
+            try:
+                print(f"[client] Connecting to {ws_url} ...")
+                async with websockets.connect(ws_url) as ws:
+                    _ws_connection = ws
+                    registration = {
+                        "type": "register",
+                        "v_min_x": v_min_x,
+                        "v_min_y": v_min_y,
+                        "screen_width": screen_width,
+                        "screen_height": screen_height,
+                    }
+                    await register_with_server(ws, registration)
+                    connected_once = True
+                    _notify_status(on_status, "connected", server_url)
+                    print("[client] Connected and registered.")
 
-                # Message loop
-                async for raw in ws:
-                    await handle_message(raw, ws)
+                    if stop_event is None:
+                        await _receive_client_messages(ws)
+                    elif await _receive_until_stopped(ws, stop_event):
+                        break
+                    if stop_event is None or not stop_event.is_set():
+                        _notify_status(
+                            on_status,
+                            "disconnected" if connected_once else "failed",
+                            "server closed the WebSocket connection",
+                        )
 
-        except (websockets.exceptions.ConnectionClosed,
-                websockets.exceptions.WebSocketException,
-                OSError) as e:
-            print(f"[client] Disconnected ({e}). Retrying in 3 seconds...")
-        except Exception as e:
-            print(f"[client] Unexpected error: {e}. Retrying in 3 seconds...")
+            except (websockets.exceptions.ConnectionClosed,
+                    websockets.exceptions.WebSocketException,
+                    OSError,
+                    ConnectionError,
+                    asyncio.TimeoutError) as e:
+                print(f"[client] Disconnected ({e}). Retrying in 3 seconds...")
+                if stop_event is None or not stop_event.is_set():
+                    _notify_status(
+                        on_status,
+                        "disconnected" if connected_once else "failed",
+                        str(e),
+                    )
+            except Exception as e:
+                print(f"[client] Unexpected error: {e}. Retrying in 3 seconds...")
+                if stop_event is None or not stop_event.is_set():
+                    _notify_status(
+                        on_status,
+                        "disconnected" if connected_once else "failed",
+                        str(e),
+                    )
+            finally:
+                _ws_connection = None
+                active = False
+                # Drop any keys the virtual HID device still holds so none stay
+                # stuck down after a mid-keystroke disconnect.
+                if _vhid is not None:
+                    _vhid.release_all()
 
+            if stop_event is not None and stop_event.is_set():
+                break
+            await _retry_delay(stop_event)
+    finally:
         _ws_connection = None
-        global active
         active = False
-        await asyncio.sleep(3)
+        _notify_status(on_status, "stopped", "")
 
 
 # ---------------------------------------------------------------------------
 # Server discovery
 # ---------------------------------------------------------------------------
 
-SERVER_PORT: int = 8080
+SERVER_PORT: int = 9090
+
+
+def _get_local_ip() -> str | None:
+    """Return the IPv4 address used for the default outbound route, if known."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+    except OSError:
+        return None
 
 
 async def _probe(ip: str, timeout: float = 0.35) -> str | None:
@@ -550,18 +663,19 @@ async def _probe(ip: str, timeout: float = 0.35) -> str | None:
 
 async def _scan_subnet() -> list[str]:
     """Concurrently probe every host on the local /24 subnet."""
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        s.connect(("8.8.8.8", 80))
-        local_ip = s.getsockname()[0]
-        s.close()
-    except Exception:
+    local_ip = _get_local_ip()
+    if local_ip is None:
         return []
 
     network = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
     tasks = [_probe(str(h)) for h in network.hosts() if str(h) != local_ip]
     results = await asyncio.gather(*tasks)
     return [ip for ip in results if ip is not None]
+
+
+async def scan_servers() -> list[str]:
+    """Find hosts on the current IPv4 /24 with MegaMind's TCP port open."""
+    return await _scan_subnet()
 
 
 def select_server() -> str:

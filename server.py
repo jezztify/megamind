@@ -4,7 +4,7 @@ MegaMind Server — runs on the machine with the physical keyboard and mouse.
 Usage:
     python server.py
 
-Web UI:  http://<this-machine-ip>:8080
+Web UI:  http://<this-machine-ip>:9090
 """
 
 import asyncio
@@ -36,6 +36,17 @@ screens.set_dpi_aware()
 
 from pynput import keyboard, mouse
 
+# macOS: use a direct Quartz CGEventTap for keyboard capture, which intercepts
+# key events BEFORE macOS processes system shortcuts (e.g. Ctrl+Arrow for Mission
+# Control). pynput's listener misses these because macOS consumes them first.
+_mac_kbd_capture = None
+if platform.system() == "Darwin":
+    try:
+        from keyboard_capture_mac import MacKeyboardCapture
+        _mac_kbd_capture = True  # sentinel: module available
+    except ImportError:
+        pass
+
 # Windows: capture true relative motion via Raw Input so the cursor can stay
 # suppressed (frozen, no click leak) while we still read movement.
 _rawinput = None
@@ -58,7 +69,7 @@ if platform.system() == "Windows":
 
 EDGE_MARGIN: int = 3          # pixels from screen edge to trigger a switch
 RECENTER_MARGIN: int = 200    # warp cursor back to center when this close to a screen edge
-PORT: int = 8080
+PORT: int = 9090
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -225,13 +236,25 @@ def restart_keyboard(suppress: bool) -> None:
                 pass
             _keyboard_listener = None
 
-        kl = keyboard.Listener(
-            on_press=on_press,
-            on_release=on_release,
-            suppress=suppress,
-        )
-        kl.start()
-        _keyboard_listener = kl
+        # On macOS with suppress, use the direct Quartz CGEventTap which
+        # intercepts ALL key events (including Ctrl+Arrow that macOS would
+        # otherwise consume for Mission Control space-switching).
+        if _mac_kbd_capture and suppress:
+            cap = MacKeyboardCapture(
+                on_press=on_press,
+                on_release=on_release,
+                suppress=True,
+            )
+            cap.start()
+            _keyboard_listener = cap
+        else:
+            kl = keyboard.Listener(
+                on_press=on_press,
+                on_release=on_release,
+                suppress=suppress,
+            )
+            kl.start()
+            _keyboard_listener = kl
 
 
 # ---------------------------------------------------------------------------
@@ -367,7 +390,13 @@ async def _switch_to(ip: str, direction: str) -> None:
         _switching = False
         return
 
+    previous_active = active
     active = ip
+    if previous_active != "server" and previous_active != ip and previous_active in clients:
+        await _safe_send(
+            clients[previous_active]["ws"],
+            json.dumps({"type": "set_inactive"}),
+        )
 
     # Warp cursor to center; subsequent moves are measured as deltas from here.
     global _recentering, _last_x, _last_y, _active_direction
@@ -420,8 +449,14 @@ async def _switch_to(ip: str, direction: str) -> None:
 async def _switch_to_server(cursor_x: int, cursor_y: int) -> None:
     global active, _switching, _last_x, _last_y
 
+    previous_active = active
     active = "server"
     _switching = False
+    if previous_active != "server" and previous_active in clients:
+        await _safe_send(
+            clients[previous_active]["ws"],
+            json.dumps({"type": "set_inactive"}),
+        )
 
     # Place the cursor just inside the edge we originally crossed, so returning
     # feels continuous and we don't immediately re-trigger that edge. (The x,y
@@ -440,6 +475,19 @@ async def _switch_to_server(cursor_x: int, cursor_y: int) -> None:
 
     await _set_input_mode(remote=False)
     await _broadcast_state()
+
+
+async def _switch_back_to_server_if_active(
+    client_ip: str,
+    cursor_x: int,
+    cursor_y: int,
+) -> bool:
+    """Ignore stale return-edge signals from a client that lost control."""
+    if active != client_ip:
+        print(f"[server] Ignoring return-edge message from inactive client {client_ip}")
+        return False
+    await _switch_to_server(cursor_x, cursor_y)
+    return True
 
 
 async def _set_input_mode(remote: bool) -> None:
@@ -571,25 +619,36 @@ async def lifespan(app: FastAPI):
     restart_mouse(suppress=False)
     restart_keyboard(suppress=False)
 
+    clipboard_monitor_stop = None
+    clipboard_monitor = None
     if clipboard_sync.available():
-        clipboard_sync.start_monitor(_on_local_clipboard)
+        clipboard_monitor_stop = threading.Event()
+        clipboard_monitor = clipboard_sync.start_monitor(
+            _on_local_clipboard,
+            stop_event=clipboard_monitor_stop,
+        )
         print("[server] Clipboard sync enabled.")
     else:
         print("[server] Clipboard sync unavailable (pyperclip missing).")
 
-    yield
-
-    # Cleanup
-    if _raw_stop:
-        try:
-            _raw_stop()
-        except Exception:
-            pass
-    with _listener_lock:
-        if _mouse_listener:
-            _mouse_listener.stop()
-        if _keyboard_listener:
-            _keyboard_listener.stop()
+    try:
+        yield
+    finally:
+        # Cleanup
+        if clipboard_monitor_stop is not None:
+            clipboard_monitor_stop.set()
+        if clipboard_monitor is not None:
+            clipboard_monitor.join()
+        if _raw_stop:
+            try:
+                _raw_stop()
+            except Exception:
+                pass
+        with _listener_lock:
+            if _mouse_listener:
+                _mouse_listener.stop()
+            if _keyboard_listener:
+                _keyboard_listener.stop()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -627,6 +686,7 @@ async def ws_client_endpoint(websocket: WebSocket):
         print(f"[server] Registered {client_ip} "
               f"({data.get('screen_width')}x{data.get('screen_height')} "
               f"@ {data.get('v_min_x', 0)},{data.get('v_min_y', 0)})")
+        await websocket.send_text(json.dumps({"type": "registered"}))
         await _broadcast_state()
 
         # Listen for messages from this client
@@ -638,7 +698,7 @@ async def ws_client_endpoint(websocket: WebSocket):
                 x = msg.get("x", screen_width // 2)
                 y = msg.get("y", screen_height // 2)
                 print(f"[server] Switching back to server (cursor at {x},{y})")
-                await _switch_to_server(x, y)
+                await _switch_back_to_server_if_active(client_ip, x, y)
 
             elif msg.get("type") == "clipboard":
                 # Apply locally, then fan out to every OTHER client.
@@ -669,6 +729,8 @@ async def ws_client_endpoint(websocket: WebSocket):
 
 @app.websocket("/ws/ui")
 async def ws_ui_endpoint(websocket: WebSocket):
+    global layout
+
     await websocket.accept()
     ui_clients.append(websocket)
     print(f"[server] UI connected: {websocket.client.host}")
@@ -682,8 +744,8 @@ async def ws_ui_endpoint(websocket: WebSocket):
             msg = json.loads(raw)
 
             if msg.get("type") == "layout_update":
-                layout.clear()
-                layout.update(msg.get("layout", {}))
+                new_layout = msg.get("layout", {})
+                layout = new_layout if isinstance(new_layout, dict) else {}
                 print(f"[server] Layout updated: {layout}")
                 await _broadcast_state()
 

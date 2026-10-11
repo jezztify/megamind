@@ -18,13 +18,18 @@ if ! command -v pyinstaller &>/dev/null; then
     pip install pyinstaller
 fi
 
-# Ensure Quartz bindings are present for smooth cursor injection
-pip install pyobjc-framework-Quartz --quiet
+# Install application dependencies before PyInstaller analyzes client and server imports.
+pip install -r requirements.txt
 
 # Build the single binary
 echo ""
 echo "Building MegaMind_Client binary..."
 pyinstaller megamind_client.spec --clean --noconfirm
+
+# Build the local desktop control panel as a macOS application bundle.
+echo ""
+echo "Building MegaMind_Control_Panel.app..."
+pyinstaller megamind_control_panel.spec --clean --noconfirm
 
 # Rename to the install name
 BINARY="dist/MegaMind_Client"
@@ -51,12 +56,36 @@ pkgbuild \
     --install-location / \
     "$PKG_OUT"
 
+# Package the app bundle separately so users can install it in /Applications.
+PANEL_APP="dist/MegaMind_Control_Panel.app"
+if [ ! -d "$PANEL_APP" ]; then
+    echo "ERROR: expected app bundle at $PANEL_APP" >&2
+    exit 1
+fi
+
+PANEL_STAGING="dist/control_panel_pkg_staging"
+rm -rf "$PANEL_STAGING"
+mkdir -p "$PANEL_STAGING/Applications"
+cp -R "$PANEL_APP" "$PANEL_STAGING/Applications/"
+
+PANEL_PKG="dist/MegaMind_Control_Panel.pkg"
+echo ""
+echo "Creating ${PANEL_PKG}..."
+pkgbuild \
+    --root "$PANEL_STAGING" \
+    --identifier "com.megamind.controlpanel" \
+    --version "$VERSION" \
+    --install-location / \
+    "$PANEL_PKG"
+
 echo ""
 echo "=== Done ==="
 echo "  ${PKG_OUT}  — installs megamind-client to ${INSTALL_DIR}"
+echo "  ${PANEL_PKG}  — installs MegaMind_Control_Panel.app to /Applications"
 echo ""
 echo "Usage after install:"
-echo "  megamind-client http://<server-ip>:8080"
+echo "  megamind-client http://<server-ip>:9090"
+echo "  Open /Applications/MegaMind_Control_Panel.app"
 echo ""
 echo "NOTE: macOS will require Accessibility permission on first run."
 echo "      System Settings > Privacy & Security > Accessibility"
